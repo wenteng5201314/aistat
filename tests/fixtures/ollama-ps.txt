@@ -1,0 +1,2 @@
+NAME                            ID              SIZE     PROCESSOR    CONTEXT    UNTIL
+qwen3.6:35b-a3b-coding-nvfp4    cd2692a833e6    31 GB    100% GPU     65536      3 minutes from now

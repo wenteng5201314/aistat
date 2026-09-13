@@ -1,0 +1,1 @@
+GPU HW active residency: 16.67%

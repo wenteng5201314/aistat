@@ -1,0 +1,159 @@
+#!/bin/bash
+
+set -u
+
+USE_INTERACTIVE_GPU=0
+DISABLE_COLOR=0
+
+usage() {
+  cat <<'EOF'
+Usage: aistat [--gpu] [--no-color] [--help]
+
+顯示 macOS Apple Silicon 的 Ollama、記憶體、Docker、GPU 與記憶體壓力。
+
+  --gpu       允許 sudo 取得一次 GPU 使用率
+  --no-color  停用 ANSI 顏色
+  --help      顯示此說明
+EOF
+}
+
+trim() { printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+
+bytes_human() {
+  awk -v bytes="${1:-0}" 'BEGIN {
+    if (bytes >= 10737418240) printf "%.1f GiB", bytes / 1073741824;
+    else if (bytes >= 1073741824) printf "%.2f GiB", bytes / 1073741824;
+    else if (bytes >= 1048576) printf "%.1f MiB", bytes / 1048576;
+    else if (bytes >= 1024) printf "%.1f KiB", bytes / 1024;
+    else printf "%.0f B", bytes;
+  }'
+}
+
+section() { printf '\n%s\n' "── $1 ──────────────────────────────────────"; }
+
+init_colors() {
+  RED='' YELLOW='' GREEN='' CYAN='' RESET=''
+  if [ "$DISABLE_COLOR" -eq 0 ] && [ -z "${NO_COLOR:-}" ] && { [ -t 1 ] || [ "${AISTAT_FORCE_COLOR:-0}" = 1 ]; }; then
+    RED=$(printf '\033[31m'); YELLOW=$(printf '\033[33m'); GREEN=$(printf '\033[32m')
+    CYAN=$(printf '\033[36m'); RESET=$(printf '\033[0m')
+  fi
+}
+
+print_ollama() {
+  section 'Ollama'
+  if ! command -v ollama >/dev/null 2>&1; then printf '  狀態       未安裝\n'; return; fi
+  output=$(ollama ps 2>/dev/null) || { printf '  狀態       服務未執行或無法連線\n'; return; }
+  lines=$(printf '%s\n' "$output" | awk 'NR > 1 && NF { count++ } END { print count+0 }')
+  [ "$lines" -gt 0 ] || { printf '  狀態       沒有載入中的模型\n'; return; }
+  printf '  %-34s %-12s %-10s %s\n' '模型' 'GPU' 'Context' 'Until'
+  printf '%s\n' "$output" | awk '
+    NR == 1 { p=index($0,"PROCESSOR"); c=index($0,"CONTEXT"); u=index($0,"UNTIL"); next }
+    NF && p && c && u {
+      name=substr($0,1,p-1); proc=substr($0,p,c-p); ctx=substr($0,c,u-c); until=substr($0,u)
+      gsub(/^[ \t]+|[ \t]+$/, "", name); gsub(/^[ \t]+|[ \t]+$/, "", proc)
+      gsub(/^[ \t]+|[ \t]+$/, "", ctx); gsub(/^[ \t]+|[ \t]+$/, "", until)
+      printf "  %-34s %-12s %-10s %s\n", name, proc, ctx, until
+    }'
+}
+
+vm_value() {
+  printf '%s\n' "$1" | awk -F: -v key="$2" '$1 == key { gsub(/[^0-9]/,"",$2); print $2+0; exit }'
+}
+
+print_memory() {
+  section '記憶體'
+  total=$(sysctl -n hw.memsize 2>/dev/null || printf '0')
+  vm=$(vm_stat 2>/dev/null || true)
+  page_size=$(printf '%s\n' "$vm" | awk 'NR==1 { if (match($0,/page size of [0-9]+/)) { x=substr($0,RSTART,RLENGTH); gsub(/[^0-9]/,"",x); print x } }')
+  page_size=${page_size:-4096}
+  free=$(vm_value "$vm" 'Pages free')
+  active=$(vm_value "$vm" 'Pages active')
+  inactive=$(vm_value "$vm" 'Pages inactive')
+  speculative=$(vm_value "$vm" 'Pages speculative')
+  wired=$(vm_value "$vm" 'Pages wired down')
+  purgeable=$(vm_value "$vm" 'Pages purgeable')
+  compressed=$(vm_value "$vm" 'Pages occupied by compressor')
+  free=${free:-0}; active=${active:-0}; inactive=${inactive:-0}; speculative=${speculative:-0}
+  wired=${wired:-0}; purgeable=${purgeable:-0}; compressed=${compressed:-0}
+  used=$(awk -v t="$total" -v p="$page_size" -v f="$free" -v i="$inactive" -v s="$speculative" -v g="$purgeable" 'BEGIN { x=t-p*(f+i+s+g); if(x<0)x=0; printf "%.0f",x }')
+  app=$(awk -v p="$page_size" -v a="$active" -v s="$speculative" 'BEGIN { printf "%.0f",p*(a+s) }')
+  wired_b=$(awk -v p="$page_size" -v n="$wired" 'BEGIN { printf "%.0f",p*n }')
+  compressed_b=$(awk -v p="$page_size" -v n="$compressed" 'BEGIN { printf "%.0f",p*n }')
+  swap=$(sysctl vm.swapusage 2>/dev/null | sed -nE 's/.*used = ([0-9.]+)([MG]).*/\1 \2/p')
+  if [ -n "$swap" ]; then
+    swap_b=$(printf '%s\n' "$swap" | awk '{ m=($2=="G"?1073741824:1048576); printf "%.0f",$1*m }')
+    swap_h=$(bytes_human "$swap_b")
+  else swap_h='無法取得'; fi
+  printf '  總量       %s\n' "$(bytes_human "$total")"
+  printf '  已使用     %s（估算）\n' "$(bytes_human "$used")"
+  printf '  App        %s（估算）\n' "$(bytes_human "$app")"
+  printf '  Wired      %s\n' "$(bytes_human "$wired_b")"
+  printf '  Compressed %s\n' "$(bytes_human "$compressed_b")"
+  printf '  Swap       %s\n' "$swap_h"
+  VM_TOTAL=$total VM_FREE_PAGES=$free VM_INACTIVE=$inactive VM_SPECULATIVE=$speculative VM_PURGEABLE=$purgeable VM_PAGE_SIZE=$page_size
+}
+
+print_docker() {
+  section 'Docker'
+  if ! command -v docker >/dev/null 2>&1; then printf '  狀態       未安裝\n'; return; fi
+  if ! docker info >/dev/null 2>&1; then printf '  狀態       Docker 引擎未執行\n'; return; fi
+  stats=$(docker stats --no-stream --format '{{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}' 2>/dev/null) || { printf '  狀態       無法取得容器統計\n'; return; }
+  [ -n "$stats" ] || { printf '  狀態       沒有執行中的容器\n'; return; }
+  printf '  %-28s %-22s %s\n' '容器' '記憶體' '比例'
+  printf '%s\n' "$stats" | awk -F '\t' '{ printf "  %-28s %-22s %s\n",$1,$2,$3 }'
+}
+
+print_gpu() {
+  section 'GPU'
+  if ! command -v powermetrics >/dev/null 2>&1; then printf '  狀態       powermetrics 無法使用\n'; return; fi
+  gpu=''
+  if [ "$USE_INTERACTIVE_GPU" -eq 1 ]; then
+    gpu=$(sudo powermetrics --samplers gpu_power -n 1 2>/dev/null) || true
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    gpu=$(sudo -n powermetrics --samplers gpu_power -n 1 2>/dev/null) || true
+  else
+    printf '  狀態       需要 sudo 權限（執行 aistat --gpu）\n'; return
+  fi
+  residency=$(printf '%s\n' "$gpu" | sed -nE 's/.*GPU HW active residency:[[:space:]]*([0-9.]+%).*/\1/p' | head -n 1)
+  if [ -n "$residency" ]; then printf '  GPU 使用率 %s\n' "$residency"; else printf '  狀態       無法解析 powermetrics 輸出\n'; fi
+}
+
+print_pressure() {
+  section 'Memory Pressure'
+  pressure=$(memory_pressure 2>/dev/null | sed -nE 's/.*free percentage:[[:space:]]*([0-9]+)%.*/\1/p' | head -n 1)
+  source='memory_pressure'
+  if [ -z "$pressure" ]; then
+    pressure=$(awk -v t="${VM_TOTAL:-0}" -v p="${VM_PAGE_SIZE:-4096}" -v f="${VM_FREE_PAGES:-0}" -v i="${VM_INACTIVE:-0}" -v s="${VM_SPECULATIVE:-0}" -v g="${VM_PURGEABLE:-0}" 'BEGIN { if(t>0) printf "%.0f",100*p*(f+i+s+g)/t }')
+    source='vm_stat 估算'
+  fi
+  if [ -z "$pressure" ]; then printf '  狀態       無法取得\n'; return; fi
+  if [ "$pressure" -ge 20 ]; then label='正常'; color=$GREEN
+  elif [ "$pressure" -ge 10 ]; then label='注意'; color=$YELLOW
+  else label='嚴重'; color=$RED; fi
+  printf '  狀態       %s%s%s（可用 %s%%，來源：%s）\n' "$color" "$label" "$RESET" "$pressure" "$source"
+}
+
+main() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --gpu) USE_INTERACTIVE_GPU=1 ;;
+      --no-color) DISABLE_COLOR=1 ;;
+      --help|-h) usage; return 0 ;;
+      *) printf '未知參數：%s\n' "$1" >&2; usage >&2; return 2 ;;
+    esac
+    shift
+  done
+  if [ "$(uname -s 2>/dev/null)" != Darwin ] || [ "$(uname -m 2>/dev/null)" != arm64 ]; then
+    printf 'aistat 僅支援 macOS Apple Silicon。\n' >&2; return 1
+  fi
+  init_colors
+  printf '%sAI 系統儀表板%s\n' "$CYAN" "$RESET"
+  print_ollama
+  print_memory
+  print_docker
+  print_gpu
+  print_pressure
+  printf '\n'
+}
+
+main "$@"

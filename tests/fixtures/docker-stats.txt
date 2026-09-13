@@ -1,0 +1,1 @@
+ollama-webui	1.2GiB / 4GiB	30.00%
